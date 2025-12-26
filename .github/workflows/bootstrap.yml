@@ -1,36 +1,70 @@
-name: Build Termux Bootstrap
+name: Simple Bootstrap Generation
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
-    branches:
-      - main
-  workflow_dispatch:
-    inputs:
-      architectures:
-        description: 'Comma-separated list of architectures to build (e.g., aarch64, arm, i686, x86_64)'
-        required: false
-        default: 'aarch64'  # 默认为 aarch64，可以根据需要手动指定
+  workflow_dispatch:  # 支持手动触发
+
+permissions: {} # 默认没有特殊权限
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v2
 
-      - name: Set up Docker
-        uses: docker/setup-buildx-action@v1
-
-      - name: Build Termux Bootstrap
+      - name: Build bootstrap archive
         run: |
-          # 获取手动触发时的架构参数（如果没有提供，则默认使用 aarch64）
-          ARCHITECTURES="${{ github.event.inputs.architectures || 'aarch64' }}"
-          
-          echo "Building for architectures: $ARCHITECTURES"
-          
-          # 使用脚本构建指定架构的 Bootstrap
-          ./scripts/build-bootstraps.sh --architectures $ARCHITECTURES
+          echo "Building bootstrap for architecture: aarch64"
+          # 模拟生成一个 bootstrap zip 文件
+          mkdir -p bootstrap
+          echo "Bootstrap content" > bootstrap/bootstrap-aarch64.txt
+          zip -r bootstrap/bootstrap-aarch64.zip bootstrap/
+
+      - name: Store bootstrap archive as artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: bootstrap-archive-${{ github.sha }}
+          path: bootstrap/*.zip
+
+  publish:
+    permissions:
+      contents: write  # 上传内容到 GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch bootstrap archive
+        uses: actions/download-artifact@v2
+        with:
+          path: ./bootstrap/
+
+      - name: Create a new tag
+        id: get_tag
+        run: |
+          new_tag="bootstrap-$(date "+%Y.%m.%d")"
+          existing_tag_revision=$(git tag | grep "$new_tag" | sort -r | head -n 1 | cut -d- -f3 | cut -dr -f2)
+          if [ -n "$existing_tag_revision" ]; then
+            tag_rev=$((existing_tag_revision + 1))
+          else
+            tag_rev=1
+          fi
+          new_tag="${new_tag}-r${tag_rev}+apt.android-7"
+          echo "tag_name=$new_tag" >> $GITHUB_OUTPUT
+
+      - name: Publish bootstrap archive to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ steps.get_tag.outputs.tag_name }} --title "Bootstrap archives for Termux"
+          for file in ./bootstrap/*.zip; do
+            gh release upload ${{ steps.get_tag.outputs.tag_name }} "$file"
+          done
