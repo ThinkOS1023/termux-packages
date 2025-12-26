@@ -26,7 +26,7 @@ jobs:
           zip -r bootstrap/bootstrap-aarch64.zip bootstrap/
 
       - name: Store bootstrap archive as artifact
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3  # 使用v3版本
         with:
           name: bootstrap-archive-${{ github.sha }}
           path: bootstrap/*.zip
@@ -43,7 +43,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch bootstrap archive
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3  # 使用v3版本
         with:
           path: ./bootstrap/
 
