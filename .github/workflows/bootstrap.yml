@@ -7,18 +7,30 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: 'Comma-separated list of architectures to build (e.g., aarch64, arm, i686, x86_64)'
+        required: false
+        default: 'aarch64'  # 默认为 aarch64，可以根据需要手动指定
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v2
 
-    - name: Set up Docker
-      uses: docker/setup-buildx-action@v1
-      
-    - name: Build Termux Bootstrap
-      run: |
-        ./scripts/build-bootstraps.sh --architectures aarch64
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v2
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v1
+
+      - name: Build Termux Bootstrap
+        run: |
+          # 获取手动触发时的架构参数（如果没有提供，则默认使用 aarch64）
+          ARCHITECTURES="${{ github.event.inputs.architectures || 'aarch64' }}"
+          
+          echo "Building for architectures: $ARCHITECTURES"
+          
+          # 使用脚本构建指定架构的 Bootstrap
+          ./scripts/build-bootstraps.sh --architectures $ARCHITECTURES
