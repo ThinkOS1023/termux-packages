@@ -1,70 +1,336 @@
-name: Simple Bootstrap Generation
+name: Build Custom Bootstrap Archives
 
 on:
-  workflow_dispatch:  # 支持手动触发
+  workflow_dispatch:
+    inputs:
+      custom_package_name:
+        description: '自定义包名 (例如: com.mytermux)'
+        required: true
+        default: 'com.termux'
+      architectures:
+        description: '目标架构 (逗号分隔: aarch64,arm,i686,x86_64)'
+        required: false
+        default: 'aarch64'
+      additional_packages:
+        description: '额外的包 (逗号分隔，可选)'
+        required: false
+        default: ''
+      use_improved_script:
+        description: '使用改进版 build-bootstraps.sh (推荐)'
+        required: false
+        type: boolean
+        default: true
+  
+  schedule:
+    - cron: '0 2 * * 0'
 
-permissions: {} # 默认没有特殊权限
-
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+env:
+  # 改进版脚本的分支（修复了很多 bug）
+  IMPROVED_BRANCH: 'agnostic-apollo/termux-packages'
+  IMPROVED_BRANCH_NAME: 'infra-improvs'
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      architectures: ${{ steps.set-matrix.outputs.architectures }}
+      package_name: ${{ steps.set-vars.outputs.package_name }}
+    steps:
+      - name: 设置构建矩阵
+        id: set-matrix
+        run: |
+          ARCHS="${{ github.event.inputs.architectures || 'aarch64' }}"
+          # 转换为 JSON 数组格式
+          ARCH_ARRAY=$(echo "$ARCHS" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$";""))')
+          echo "architectures=$ARCH_ARRAY" >> $GITHUB_OUTPUT
+      
+      - name: 设置变量
+        id: set-vars
+        run: |
+          PKG_NAME="${{ github.event.inputs.custom_package_name || 'com.termux' }}"
+          echo "package_name=$PKG_NAME" >> $GITHUB_OUTPUT
+          echo "使用的包名: $PKG_NAME"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.prepare.outputs.architectures) }}
     
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v2
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1000
 
-      - name: Build bootstrap archive
+      - name: 检出改进版分支（如果启用）
+        if: github.event.inputs.use_improved_script == 'true'
         run: |
-          echo "Building bootstrap for architecture: aarch64"
-          # 模拟生成一个 bootstrap zip 文件
-          mkdir -p bootstrap
-          echo "Bootstrap content" > bootstrap/bootstrap-aarch64.txt
-          zip -r bootstrap/bootstrap-aarch64.zip bootstrap/
-
-      - name: Store bootstrap archive as artifact
-        uses: actions/upload-artifact@v3  # 使用v3版本
-        with:
-          name: bootstrap-archive-${{ github.sha }}
-          path: bootstrap/*.zip
-
-  publish:
-    permissions:
-      contents: write  # 上传内容到 GitHub Releases
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-
-      - name: Fetch bootstrap archive
-        uses: actions/download-artifact@v3  # 使用v3版本
-        with:
-          path: ./bootstrap/
-
-      - name: Create a new tag
-        id: get_tag
-        run: |
-          new_tag="bootstrap-$(date "+%Y.%m.%d")"
-          existing_tag_revision=$(git tag | grep "$new_tag" | sort -r | head -n 1 | cut -d- -f3 | cut -dr -f2)
-          if [ -n "$existing_tag_revision" ]; then
-            tag_rev=$((existing_tag_revision + 1))
+          echo "正在获取改进版 build-bootstraps.sh 脚本..."
+          git remote add improved https://github.com/${{ env.IMPROVED_BRANCH }}.git || true
+          git fetch improved ${{ env.IMPROVED_BRANCH_NAME }}
+          git checkout improved/${{ env.IMPROVED_BRANCH_NAME }} -- scripts/build-bootstraps.sh || true
+          
+          if [ -f "scripts/build-bootstraps.sh" ]; then
+            echo "✅ 成功获取改进版脚本"
+            head -n 20 scripts/build-bootstraps.sh
           else
-            tag_rev=1
+            echo "⚠️ 使用原版脚本"
           fi
-          new_tag="${new_tag}-r${tag_rev}+apt.android-7"
-          echo "tag_name=$new_tag" >> $GITHUB_OUTPUT
 
-      - name: Publish bootstrap archive to GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 释放磁盘空间
         run: |
-          gh release create ${{ steps.get_tag.outputs.tag_name }} --title "Bootstrap archives for Termux"
-          for file in ./bootstrap/*.zip; do
-            gh release upload ${{ steps.get_tag.outputs.tag_name }} "$file"
-          done
+          echo "清理前磁盘空间:"
+          df -h
+          
+          # 删除不需要的软件
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          sudo docker image prune --all --force
+          
+          echo "清理后磁盘空间:"
+          df -h
+
+      - name: 修改包名配置
+        run: |
+          echo "正在修改 TERMUX_APP_PACKAGE 为: ${{ needs.prepare.outputs.package_name }}"
+          
+          # 备份原始文件
+          cp scripts/properties.sh scripts/properties.sh.bak
+          
+          # 修改包名
+          sed -i 's/TERMUX_APP_PACKAGE=.*/TERMUX_APP_PACKAGE="${{ needs.prepare.outputs.package_name }}"/' scripts/properties.sh
+          
+          echo "修改后的配置:"
+          grep "TERMUX_APP_PACKAGE" scripts/properties.sh
+
+      - name: 构建 Docker 镜像
+        run: |
+          cd scripts
+          docker build \
+            --tag termux/package-builder:latest \
+            --file Dockerfile \
+            .
+
+      - name: 构建 Bootstrap (本地编译)
+        run: |
+          # 准备额外包参数
+          EXTRA_PACKAGES=""
+          if [ -n "${{ github.event.inputs.additional_packages }}" ]; then
+            EXTRA_PACKAGES="--add ${{ github.event.inputs.additional_packages }}"
+          fi
+          
+          echo "========================================="
+          echo "开始构建 Bootstrap"
+          echo "架构: ${{ matrix.arch }}"
+          echo "包名: ${{ needs.prepare.outputs.package_name }}"
+          echo "额外包: ${{ github.event.inputs.additional_packages }}"
+          echo "========================================="
+          
+          # 在 Docker 容器中运行构建
+          docker run \
+            --rm \
+            --volume "${GITHUB_WORKSPACE}:/home/builder/termux-packages" \
+            termux/package-builder:latest \
+            bash -c "
+              set -e
+              cd /home/builder/termux-packages
+              
+              # 显示配置
+              echo '当前包名配置:'
+              grep TERMUX_APP_PACKAGE scripts/properties.sh
+              
+              # 清理之前的构建（重要！）
+              echo '清理之前的构建...'
+              ./clean.sh || true
+              
+              # 构建 Bootstrap
+              echo '开始构建 Bootstrap (这可能需要 2-6 小时)...'
+              ./scripts/build-bootstraps.sh \
+                --architectures ${{ matrix.arch }} \
+                ${EXTRA_PACKAGES} \
+                2>&1 | tee build.log
+              
+              echo 'Bootstrap 构建完成！'
+              ls -lh bootstrap-*.zip 2>/dev/null || echo '未找到 bootstrap 文件'
+            "
+        timeout-minutes: 420  # 7 小时超时
+
+      - name: 验证 Bootstrap 文件
+        run: |
+          if [ ! -f "bootstrap-${{ matrix.arch }}.zip" ]; then
+            echo "❌ 错误: bootstrap-${{ matrix.arch }}.zip 未生成"
+            echo "查看构建日志:"
+            tail -n 100 build.log || true
+            exit 1
+          fi
+          
+          echo "✅ Bootstrap 文件信息:"
+          ls -lh bootstrap-${{ matrix.arch }}.zip
+          
+          # 验证 ZIP 完整性
+          if ! unzip -t bootstrap-${{ matrix.arch }}.zip > /dev/null 2>&1; then
+            echo "❌ 错误: ZIP 文件损坏"
+            exit 1
+          fi
+          
+          # 检查包名是否正确
+          echo "验证包名配置..."
+          unzip -p bootstrap-${{ matrix.arch }}.zip ./usr/bin/termux-info 2>/dev/null | head -n 20 || true
+          
+          echo "✅ 验证通过!"
+
+      - name: 计算校验和
+        run: |
+          sha256sum bootstrap-${{ matrix.arch }}.zip > bootstrap-${{ matrix.arch }}.zip.sha256sum
+          cat bootstrap-${{ matrix.arch }}.zip.sha256sum
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.arch }}
+          path: build.log
+          retention-days: 7
+
+      - name: 上传 Bootstrap 归档
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-${{ matrix.arch }}-${{ needs.prepare.outputs.package_name }}
+          path: |
+            bootstrap-${{ matrix.arch }}.zip
+            bootstrap-${{ matrix.arch }}.zip.sha256sum
+          retention-days: 30
+
+  create-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载所有 Bootstrap 文件
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bootstrap-*
+          path: ./bootstraps
+
+      - name: 准备发布文件
+        run: |
+          mkdir -p release-files
+          
+          # 查找所有 bootstrap 文件
+          find ./bootstraps -name "bootstrap-*.zip*" -exec cp {} release-files/ \;
+          
+          echo "发布文件列表:"
+          ls -lh release-files/
+          
+          # 生成校验和汇总
+          cd release-files
+          if ls bootstrap-*.zip 1> /dev/null 2>&1; then
+            sha256sum bootstrap-*.zip > checksums.txt
+            cat checksums.txt
+          else
+            echo "警告: 未找到 bootstrap 文件"
+          fi
+
+      - name: 生成发布信息
+        id: release_info
+        run: |
+          PKG_NAME="${{ needs.prepare.outputs.package_name }}"
+          PKG_NAME_SAFE=$(echo "$PKG_NAME" | sed 's/\./-/g')
+          VERSION="bootstrap-$(date +'%Y.%m.%d')-r1-${PKG_NAME_SAFE}"
+          
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "release_name=Bootstrap for ${PKG_NAME}" >> $GITHUB_OUTPUT
+          echo "package_name=${PKG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.release_info.outputs.version }}
+          name: ${{ steps.release_info.outputs.release_name }}
+          body: |
+            ## 自定义包名的 Bootstrap 归档
+            
+            **包名**: `${{ steps.release_info.outputs.package_name }}`
+            **构建时间**: ${{ github.event.repository.updated_at }}
+            **构建方法**: 本地编译（build-bootstraps.sh）
+            
+            ### ⚠️ 重要说明
+            
+            这些 Bootstrap 文件是为自定义包名 `${{ steps.release_info.outputs.package_name }}` 编译的，
+            **不能与官方 Termux 包混用**。
+            
+            ### 架构支持
+            
+            构建的架构: ${{ github.event.inputs.architectures }}
+            
+            ### 使用步骤
+            
+            1. 下载对应架构的 `bootstrap-<arch>.zip`
+            2. 验证 SHA256 校验和
+            3. 将文件放到 termux-app 的 `app/src/main/cpp/` 目录
+            4. 修改 termux-app 中的包名为 `${{ steps.release_info.outputs.package_name }}`
+            5. 在 `app/build.gradle` 中添加 `return` 阻止下载覆盖
+            
+            ### 校验和
+            
+            ```
+            $(cat release-files/checksums.txt 2>/dev/null || echo "未生成校验和文件")
+            ```
+            
+            ### 注意事项
+            
+            - 这些包无法使用官方 Termux APT 仓库
+            - 所有后续安装的包都需要自己编译
+            - 建议搭建自己的 APT 仓库
+            
+            ---
+            *构建耗时约 2-6 小时/架构*
+          files: |
+            release-files/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 快速方案：仅用于 com.termux（保留以供参考）
+  quick-build-official:
+    runs-on: ubuntu-latest
+    if: false  # 默认禁用，仅在使用官方包名时启用
+    strategy:
+      matrix:
+        arch: [aarch64, arm, i686, x86_64]
+    
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 快速生成 Bootstrap (仅 com.termux)
+        run: |
+          docker run \
+            --rm \
+            --volume "${GITHUB_WORKSPACE}:/home/builder/termux-packages" \
+            termux/package-builder:latest \
+            bash -c "
+              cd /home/builder/termux-packages
+              ./scripts/generate-bootstraps.sh \
+                --architectures ${{ matrix.arch }}
+            "
+
+      - name: 上传快速构建的 Bootstrap
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-quick-${{ matrix.arch }}
+          path: bootstrap-${{ matrix.arch }}.zip
